@@ -1,0 +1,382 @@
+// ============================================================
+//  ESP32 Stopwatch + RC522 RFID + WiFi HTTP POST + LCD 20x4
+// ============================================================
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ─── WiFi ───────────────────────────────────────────────────
+const char* WIFI_SSID     = "-";
+const char* WIFI_PASSWORD = "-";
+
+// ─── Endpoint ───────────────────────────────────────────────
+const char* ENDPOINT_URL  = "-";
+
+// ─── LCD 20x4 I2C ───────────────────────────────────────────
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ─── RC522 pins ─────────────────────────────────────────────
+#define RC522_SS   5
+#define RC522_RST  17
+MFRC522 rfid(RC522_SS, RC522_RST);
+
+// ─── Buttons ────────────────────────────────────────────────
+#define BTN_START  32
+#define BTN_STOP   33
+#define BTN_PAUSE  34
+#define BTN_RESET  35
+
+// ─── LEDs ───────────────────────────────────────────────────
+#define LED_START  25
+#define LED_STOP   26
+#define LED_PAUSE  27
+#define LED_RESET  14
+
+// ─── Debounce ───────────────────────────────────────────────
+#define DEBOUNCE_MS 50
+
+struct Button {
+  uint8_t       pin;
+  int           lastState;
+  int           stableState;
+  unsigned long lastChangeTime;
+  bool          triggered;
+};
+
+Button btnStart = { BTN_START, HIGH, HIGH, 0, false };
+Button btnStop  = { BTN_STOP,  HIGH, HIGH, 0, false };
+Button btnPause = { BTN_PAUSE, HIGH, HIGH, 0, false };
+Button btnReset = { BTN_RESET, HIGH, HIGH, 0, false };
+
+// ─── Stopwatch state ────────────────────────────────────────
+bool running  = false;
+bool paused   = false;
+
+unsigned long startTime  = 0;
+unsigned long pauseStart = 0;
+unsigned long totalPause = 0;
+
+String currentUID = "";
+
+unsigned long resetLedOffTime = 0;
+unsigned long lastLCDUpdate   = 0;
+#define LCD_REFRESH_MS 500
+
+// ============================================================
+//  Helpers
+// ============================================================
+
+void updateButton(Button &btn) {
+  int reading = digitalRead(btn.pin);
+  btn.triggered = false;
+  if (reading != btn.lastState) {
+    btn.lastChangeTime = millis();
+    btn.lastState = reading;
+  }
+  if ((millis() - btn.lastChangeTime) >= DEBOUNCE_MS) {
+    if (reading != btn.stableState) {
+      btn.stableState = reading;
+      if (btn.stableState == LOW) btn.triggered = true;
+    }
+  }
+}
+
+void setLEDs(bool start, bool stop, bool pause, bool reset) {
+  digitalWrite(LED_START, start ? LOW : HIGH);
+  digitalWrite(LED_STOP,  stop  ? LOW : HIGH);
+  digitalWrite(LED_PAUSE, pause ? LOW : HIGH);
+  digitalWrite(LED_RESET, reset ? LOW : HIGH);
+}
+
+String readUID() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+String getMACAddress() {
+  return WiFi.macAddress();
+}
+
+String formatTime(unsigned long ms) {
+  unsigned long sec = ms / 1000;
+  unsigned long hr  = sec / 3600;
+  unsigned long mn  = (sec % 3600) / 60;
+  unsigned long sc  = sec % 60;
+  char buf[9];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", hr, mn, sc);
+  return String(buf);
+}
+
+void updateLCD() {
+  unsigned long now = millis();
+
+  unsigned long workMs  = 0;
+  unsigned long pauseMs = totalPause;
+
+  if (running) {
+    unsigned long curPause = paused ? (now - pauseStart) : 0;
+    workMs  = now - startTime - totalPause - curPause;
+    pauseMs = totalPause + curPause;
+  }
+
+  // Line 0: สถานะ
+  lcd.setCursor(0, 0);
+  if (!running && startTime == 0) {
+    lcd.print("STATUS: READY       ");
+  } else if (running && !paused) {
+    lcd.print("STATUS: RUNNING     ");
+  } else if (running && paused) {
+    lcd.print("STATUS: PAUSED      ");
+  } else {
+    lcd.print("STATUS: STOPPED     ");
+  }
+
+  // Line 1: WORK TIME
+  lcd.setCursor(0, 1);
+  lcd.print("WORK : ");
+  lcd.print(formatTime(workMs));
+  lcd.print("     ");
+
+  // Line 2: PAUSE TIME
+  lcd.setCursor(0, 2);
+  lcd.print("PAUSE: ");
+  lcd.print(formatTime(pauseMs));
+  lcd.print("     ");
+
+  // Line 3: UID
+  lcd.setCursor(0, 3);
+  String uidLine = "UID: " + (currentUID.length() > 0 ? currentUID : "--------");
+  while (uidLine.length() < 20) uidLine += " ";
+  lcd.print(uidLine);
+}
+
+void postData(const char* status,
+              const String& uid,
+              unsigned long workMs,
+              unsigned long pauseMs) {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Not connected — skip POST");
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  doc["status"]     = status;
+  doc["uid"]        = uid;
+  doc["time"]       = workMs;
+  doc["pauseTime"]  = pauseMs;
+  doc["sn_mac"]     = getMACAddress();
+  doc["key_button"] = status;
+  doc["ip_address"] = WiFi.localIP().toString();
+  doc["ssid_wifi"]  = WIFI_SSID;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.begin(ENDPOINT_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(payload);
+  Serial.printf("[POST] %s → HTTP %d\n", status, code);
+  if (code > 0) Serial.println(http.getString());
+
+  http.end();
+}
+
+// ============================================================
+//  setup()
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ── LCD ──────────────────────────────────────────────────
+  Serial.println("[LCD] Starting Wire...");
+  Wire.begin();
+  delay(100);
+
+  Serial.println("[LCD] init...");
+  lcd.init();
+  Serial.println("[LCD] backlight...");
+  lcd.backlight();
+  Serial.println("[LCD] ready");
+
+  lcd.setCursor(0, 0);
+  lcd.print("  ESP32 Stopwatch   ");
+  lcd.setCursor(0, 1);
+  lcd.print("  Initializing...   ");
+
+  // ── Buttons & LEDs ───────────────────────────────────────
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP,  INPUT_PULLUP);
+  pinMode(BTN_PAUSE, INPUT_PULLUP);
+  pinMode(BTN_RESET, INPUT_PULLUP);
+
+  pinMode(LED_START, OUTPUT);
+  pinMode(LED_STOP,  OUTPUT);
+  pinMode(LED_PAUSE, OUTPUT);
+  pinMode(LED_RESET, OUTPUT);
+  setLEDs(false, false, false, false);
+
+  // ── RC522 ────────────────────────────────────────────────
+  SPI.begin();
+  rfid.PCD_Init();
+  Serial.println("[RFID] RC522 ready");
+
+  // ── WiFi ─────────────────────────────────────────────────
+  lcd.setCursor(0, 2);
+  lcd.print("WiFi connecting...  ");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
+    lcd.setCursor(0, 2);
+    lcd.print("WiFi OK             ");
+    lcd.setCursor(0, 3);
+    String ip = WiFi.localIP().toString();
+    while (ip.length() < 20) ip += " ";
+    lcd.print(ip);
+  } else {
+    Serial.println("\n[WiFi] FAILED");
+    lcd.setCursor(0, 2);
+    lcd.print("WiFi FAILED         ");
+    lcd.setCursor(0, 3);
+    lcd.print("Check SSID/Password ");
+  }
+
+  delay(1500);
+  lcd.clear();
+  updateLCD();
+}
+
+// ============================================================
+//  loop()
+// ============================================================
+void loop() {
+
+  unsigned long now = millis();
+
+  // ── ดับ LED RESET หลัง 500 ms ──────────────────────────
+  if (resetLedOffTime > 0 && now >= resetLedOffTime) {
+    digitalWrite(LED_RESET, HIGH);
+    resetLedOffTime = 0;
+  }
+
+  // ── อ่านปุ่ม ─────────────────────────────────────────────
+  updateButton(btnStart);
+  updateButton(btnStop);
+  updateButton(btnPause);
+  updateButton(btnReset);
+
+  // ── อ่าน RFID ────────────────────────────────────────────
+  if (!running && rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    currentUID = readUID();
+    Serial.println("[RFID] UID: " + currentUID);
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    rfid.PCD_Init();
+    updateLCD();
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  START
+  // ════════════════════════════════════════════════════════
+  if (btnStart.triggered && !running) {
+    running    = true;
+    paused     = false;
+    startTime  = now;
+    totalPause = 0;
+
+    Serial.println("START WORK | UID: " + currentUID);
+    setLEDs(true, false, false, false);
+    updateLCD();
+    postData("START", currentUID, 0, 0);
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  STOP
+  // ════════════════════════════════════════════════════════
+  if (btnStop.triggered && running) {
+    if (paused) totalPause += now - pauseStart;
+
+    running = false;
+    paused  = false;
+
+    unsigned long workMs  = now - startTime - totalPause;
+    unsigned long pauseMs = totalPause;
+
+    Serial.printf("STOP | WORK %s | PAUSE %s\n",
+                  formatTime(workMs).c_str(),
+                  formatTime(pauseMs).c_str());
+
+    setLEDs(false, true, false, false);
+    updateLCD();
+    postData("STOP", currentUID, workMs, pauseMs);
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  PAUSE / RESUME
+  // ════════════════════════════════════════════════════════
+  if (btnPause.triggered && running) {
+    if (!paused) {
+      paused     = true;
+      pauseStart = now;
+      Serial.println("PAUSE");
+      digitalWrite(LED_PAUSE, LOW);
+
+      unsigned long workSoFar = now - startTime - totalPause;
+      updateLCD();
+      postData("PAUSE", currentUID, workSoFar, totalPause);
+
+    } else {
+      paused      = false;
+      totalPause += now - pauseStart;
+      Serial.println("RESUME");
+      digitalWrite(LED_PAUSE, HIGH);
+
+      unsigned long workSoFar = now - startTime - totalPause;
+      updateLCD();
+      postData("RESUME", currentUID, workSoFar, totalPause);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  RESET
+  // ════════════════════════════════════════════════════════
+  if (btnReset.triggered) {
+    running    = false;
+    paused     = false;
+    startTime  = 0;
+    totalPause = 0;
+
+    Serial.println("RESET");
+    setLEDs(false, false, false, true);
+    resetLedOffTime = now + 500;
+    updateLCD();
+  }
+
+  // ── refresh LCD ทุก 500 ms ───────────────────────────────
+  if (now - lastLCDUpdate >= LCD_REFRESH_MS) {
+    lastLCDUpdate = now;
+    updateLCD();
+  }
+
+  delay(10);
+}
